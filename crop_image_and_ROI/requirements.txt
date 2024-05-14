@@ -1,0 +1,11 @@
+Pillow==9.3.0
+tkinter
+customtkinter==5.2.2
+
+from PIL import Image
+from PIL.ExifTags import TAGS
+import sys, os
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import ImageTk, ImageDraw
+import customtkinter
