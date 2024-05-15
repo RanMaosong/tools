@@ -13,6 +13,8 @@ import tkinter as tk
 from tkinter import filedialog, font, messagebox
 from PIL import ImageTk, ImageDraw
 import customtkinter
+import cv2
+import numpy as np
 
 
 class ImageCropper:
@@ -27,8 +29,8 @@ class ImageCropper:
         self.ratio = 1.0
         self.img_h = 400
         self.img_w = 400
-        self.min_image_h = 300
-        self.min_image_w = 300
+        self.min_image_h = 800
+        self.min_image_w = 800
         self.right_frame_width = 500
         self.img = None
         self.shape_list: List[RightFrameItem] = []
@@ -276,6 +278,7 @@ class ImageCropper:
         if self.file_in_root_path is None:
             self.file_in_root_path = "./"
         files = filedialog.askopenfilenames(initialdir=self.file_in_root_path)
+        print("Selected files: ", files)
         if isinstance(files, tuple) and len(files) > 0:
             self.files = files
             self.file_in_root_path = os.path.dirname(files[0])
@@ -332,6 +335,8 @@ class ImageCropper:
         
     
     def __update_img_size(self):
+        self.img_h = self.img_h if self.img_h > self.min_image_h else self.min_image_h
+        self.img_w = self.img_w if self.img_w > self.min_image_w else self.min_image_w
         self.scale = (self.img.size[0]/self.img_h, self.img.size[1]/self.img_w)
         self.resized_img = self.img.resize((self.img_w, self.img_h), Image.ANTIALIAS)
 
@@ -487,7 +492,9 @@ class ImageCropper:
         for image_wrapper in images:
             for shape in self.shapes:
                 if shape.shape_name == "箭头":
-                    image_wrapper.draw_arrow_on_origin_image(shape)
+                    image_wrapper.draw_arrow_on_resized_image(shape)
+                elif shape.shape_name == "矩形":
+                    image_wrapper.draw_rectange_on_origin_image(shape)
         
         index = 0
         for shape in self.shapes:
@@ -674,7 +681,7 @@ class ImageWrapper:
         except SystemError as e:
             pass
     
-    def draw_arrow_on_origin_image(self, shape: Shape):
+    def draw_arrow_on_resized_image(self, shape: Shape):
         arrow_coord = arrow_coordinates(shape)
         box = [(shape.box[0], shape.box[1]),
                (shape.box[2], shape.box[3])]
@@ -685,7 +692,12 @@ class ImageWrapper:
         
         draw = ImageDraw.Draw(self.resized_img)
         draw.line(box, fill=shape.color, width=shape.line_width*2)
-        draw.polygon(xys,  fill=shape.color, outline=shape.color, width=shape.line_width*2)
+        draw.polygon(xys,  fill=shape.color, outline=shape.color, width=shape.line_width)
+
+        # img = np.array(self.resized_img)
+        # arrow_img = cv2.arrowedLine(img, shape.box[:2], shape.box[2:], color=hex_to_rgb(shape.color), thickness=shape.line_width, tipLength=0.2, line_type=cv2.LINE_AA)
+        # self.resized_img = Image.fromarray(arrow_img)
+        
     
     def draw_rectange_on_origin_image(self, shape: Shape):
         box = [(shape.box[0] * self.scale[0],
@@ -694,7 +706,7 @@ class ImageWrapper:
                shape.box[3] * self.scale[1])]
         
         draw = ImageDraw.Draw(self.origin_img_with_rectange)
-        draw.rectangle(box, outline=shape.color, width=shape.line_width*2)
+        draw.rectangle(box, outline=shape.color, width=shape.line_width)
     
     def get_image_with_rectange(self):
         return self.origin_img_with_rectange
@@ -708,7 +720,11 @@ class ImageWrapper:
         cropped = self.resized_img.crop(box)
         cropped.save(path)
 
-        
+def hex_to_rgb(hex_code):
+    r = int(hex_code[1:3], 16)
+    g = int(hex_code[3:5], 16)
+    b = int(hex_code[5:7], 16)
+    return (r, g, b)    
     
     
     
