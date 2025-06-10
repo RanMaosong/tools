@@ -3,13 +3,20 @@
 # Note: PIL required
 # License: GPL
 ########################
+import ctypes
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except:
+    pass
 import math
+import re
 
 from typing import List
 from PIL import Image
 from PIL.ExifTags import TAGS
 import sys, os
 import tkinter as tk
+import tkinter.colorchooser
 from tkinter import filedialog, font, messagebox
 from PIL import ImageTk, ImageDraw
 import customtkinter
@@ -27,10 +34,11 @@ class ImageCropper:
         self.files = []
         self.box = [0, 0, 0, 0]
         self.ratio = 1.0
-        self.img_h = 400
-        self.img_w = 400
         self.min_image_h = 800
         self.min_image_w = 800
+        self.font_size = 10
+        self.img_h = self.min_image_h
+        self.img_w = self.min_image_w
         self.right_frame_width = 500
         self.img = None
         self.shape_list: List[RightFrameItem] = []
@@ -39,6 +47,9 @@ class ImageCropper:
         self.arrow_cur_size = 20
         self.arrow_step = 2
         self.mini_rec_area = 100
+        self.cur_file_path = None
+        self.cur_file_path_var = None
+        self.img_index = 0
 
         self.files = None
         self.file_in_root_path = None
@@ -46,7 +57,7 @@ class ImageCropper:
         self.shapes = []
         self.cur_shape = None
         self.default_color = '#ff1111'
-        self.default_line_width = 2
+        self.default_line_width = 3
         self.rectange_mode = True
         self.arrow_mode = False
         self.shape_name = "矩形"
@@ -60,6 +71,22 @@ class ImageCropper:
         self.__bind_event()
 
         self.right_frame_var = tk.IntVar()
+
+        self.color_path = "./colors.txt"
+        with open(self.color_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        self.color_candidates = []
+        for line in lines:
+            line = line.strip("\n").strip("")
+            if line != "":
+                self.color_candidates.append(line.strip("\n"))
+        
+
+
+        self.color_index = 0
+        
+        
     
     def __init_layout(self):
         self.root = root = tk.Tk()
@@ -81,47 +108,58 @@ class ImageCropper:
         self.right_frame.grid(row=1, column=1, sticky='nsew')
 
 
-        self.file_btn = tk.Button(self.top_frame, text="文  件", font=10, command=self.__on_file_button)
+        self.file_btn = tk.Button(self.top_frame, text="文  件", font=self.font_size, command=self.__on_file_button)
         self.file_btn.grid(row=0, column=0, padx=2)
         # self.top_frame.columnconfigure(0, minsize=80)
 
-        self.save_btn = tk.Button(self.top_frame, text="保  存", font=10, underline=5, command=self.__on_save_button)
+        self.save_btn = tk.Button(self.top_frame, text="保  存", font=self.font_size, underline=5, command=self.__on_save_button)
         self.save_btn.grid(row=0, column=1, padx=2)
         # self.top_frame.columnconfigure(1, minsize=80)
 
-        tk.Label(self.top_frame, text="  图像大小：", font=10).grid(row=0, column=2)
+        tk.Label(self.top_frame, text="  图像大小：", font=self.font_size).grid(row=0, column=2)
         self.vcmd = (self.top_frame.register(self.__only_numeric_input), "%P")
         self.height_str = tk.IntVar(self.top_frame, value=self.img_h)
-        self.image_h_entry = tk.Entry(self.top_frame, textvariable=self.height_str, width=5, font=10, validate="key", validatecommand=self.vcmd)
+        self.image_h_entry = tk.Entry(self.top_frame, textvariable=self.height_str, width=5, font=self.font_size, validate="key", validatecommand=self.vcmd)
         self.image_h_entry.grid(row=0, column=3)
-        tk.Label(self.top_frame, text="x", font=10).grid(row=0, column=4)
+        tk.Label(self.top_frame, text="x", font=self.font_size).grid(row=0, column=4)
         self.width_str = tk.IntVar(self.top_frame, value=self.img_w)
-        self.image_w_entry = tk.Entry(self.top_frame, textvariable=self.width_str, width=5, font=10, validate="key", validatecommand=self.vcmd)
+        self.image_w_entry = tk.Entry(self.top_frame, textvariable=self.width_str, width=5, font=self.font_size, validate="key", validatecommand=self.vcmd)
         self.image_w_entry.grid(row=0, column=5)
 
         
         self.v = tk.IntVar(self.top_frame, value=1)
-        self.rectange_mode_btn = tk.Radiobutton(self.top_frame, text="矩形框", variable=self.v, value=1, font=10, command=self.__on_rectange_mode)
+        self.rectange_mode_btn = tk.Radiobutton(self.top_frame, text="矩形框", variable=self.v, value=1, font=self.font_size, command=self.__on_rectange_mode)
         self.rectange_mode_btn.select()
         self.rectange_mode_btn.grid(row=0, column=6)
-        tk.Radiobutton(self.top_frame, text="箭头", variable=self.v, value=2, font=10, command=self.__on_arrow_mode).grid(row=0, column=7)
+        tk.Radiobutton(self.top_frame, text="箭头", variable=self.v, value=2, font=self.font_size, command=self.__on_arrow_mode).grid(row=0, column=7)
 
-        self.file_btn = tk.Button(self.top_frame, text="清  除", font=10, command=self.__on_clear_shapes)
+        self.file_btn = tk.Button(self.top_frame, text="清  除", font=self.font_size, command=self.__on_clear_shapes)
         self.file_btn.grid(row=0, column=8, padx=2)
         # self.top_frame.columnconfigure(0, minsize=80)
 
-        self.file_btn = tk.Button(self.top_frame, text="更  新", font=10, command=self.__on_update_all_shapes)
+        self.file_btn = tk.Button(self.top_frame, text="更  新", font=self.font_size, command=self.on_update_all_shapes)
         self.file_btn.grid(row=0, column=9, padx=2)
         # self.top_frame.columnconfigure(0, minsize=80)
 
-        self.arrow_up_btn = tk.Button(self.top_frame, text="箭头增大", font=10, command=self.__on_arrow_up)
+        self.arrow_up_btn = tk.Button(self.top_frame, text="箭头增大", font=self.font_size, command=self.__on_arrow_up)
         self.arrow_up_btn.grid(row=0, column=10, padx=2)
 
-        self.arrow_down_btn = tk.Button(self.top_frame, text="箭头减小", font=10, command=self.__on_arrow_down)
+        self.arrow_down_btn = tk.Button(self.top_frame, text="箭头减小", font=self.font_size, command=self.__on_arrow_down)
         self.arrow_down_btn.grid(row=0, column=11, padx=2)
         self.arrow_size_var = tk.IntVar(value=self.arrow_cur_size)
-        self.arrow_size_label = tk.Label(self.top_frame, textvariable=self.arrow_size_var, font=10)
+        self.arrow_size_label = tk.Label(self.top_frame, textvariable=self.arrow_size_var, font=self.font_size)
         self.arrow_size_label.grid(row=0, column=12)
+        
+        self.pre_shown_image = tk.Button(self.top_frame, text="显示上一张图", font=self.font_size, command=self.__on_previous_img)
+        self.pre_shown_image.grid(row=0, column=13, padx=2)
+
+        self.next_shown_image = tk.Button(self.top_frame, text="显示下一张图", font=self.font_size, command=self.__on_next_img)
+        self.next_shown_image.grid(row=0, column=14, padx=2)
+
+        self.common_colors = tk.Button(self.top_frame, text="常用颜色", font=self.font_size, command=self.__on_common_colors)
+        self.common_colors.grid(row=0, column=15, padx=2)
+
+        
 
         self.canvas = tk.Canvas(self.left_frame, 
                              highlightthickness = 0)
@@ -137,6 +175,61 @@ class ImageCropper:
                 shape_index.append(index)
         
         return shape_index
+    
+    def __on_common_colors(self):
+        def cut(editor, event=None):
+            editor.event_generate("<<Cut>>")
+        def copy(editor, event=None):
+            editor.event_generate("<<Copy>>")
+        def paste(editor, event=None):
+            editor.event_generate('<<Paste>>')
+        def rightKey(event, editor):
+            menubar.delete(0,tk.END)
+            menubar.add_command(label='剪切',command=lambda:cut(editor))
+            menubar.add_command(label='复制',command=lambda:copy(editor))
+            menubar.add_command(label='粘贴',command=lambda:paste(editor))
+            menubar.post(event.x_root,event.y_root)
+
+        color_panel = tk.Toplevel(master=self.top_frame)
+        color_panel.attributes("-toolwindow", 2)
+        color_panel.title("Colors")
+        menubar = tk.Menu(color_panel,tearoff=False)#创建一个菜单
+
+        
+        index = 0
+        while index < len(self.color_candidates):
+            row_index = index // 2
+            column_index = index % 2 * 2
+
+            color = self.color_candidates[index]
+
+            color_label = tk.Label(color_panel, text="    ", bg=color, font=self.font_size, bd=2)
+
+            color_var = tk.StringVar(color_panel, value=color)
+            color_entry = tk.Entry(color_panel, textvariable=color_var, width=8, font=self.font_size, state="readonly")
+
+            color_label.grid(row=row_index, column=column_index+0, padx=10, pady=5)
+            color_entry.grid(row=row_index, column=column_index+1, padx=10, pady=5)
+
+            color_entry.bind("<Button-3>", lambda x: rightKey(x, color_entry))
+
+            index += 1
+        
+
+
+            
+            
+
+    
+    def __on_next_img(self, event=None):
+        self.img_index += 1
+        self.img_index %= len(self.files)
+        self.__show_img(self.files)
+
+    def __on_previous_img(self, event=None):
+        self.img_index -= 1
+        self.img_index %= len(self.files)
+        self.__show_img(self.files)
     
 
     def __on_arrow_up(self):
@@ -188,6 +281,9 @@ class ImageCropper:
         self.canvas.bind("<ButtonRelease-1>", self.__on_mouse_release)
         self.canvas.bind("<B1-Motion>", self.__on_mouse_move)
 
+        self.top_frame.bind_all("<KeyPress-Left>", self.__on_previous_img)
+        self.top_frame.bind_all("<KeyPress-Right>", self.__on_next_img)
+
 
     def get_image_exif(self, image):
         if image is None:
@@ -231,6 +327,14 @@ class ImageCropper:
         return img
     
     def set_image(self, filename):
+        basename = os.path.basename(filename)
+        if self.cur_file_path_var is not None:
+            self.cur_file_path_var.set(basename)
+            self.right_frame.update()
+        else:
+            self.cur_file_path_var = tk.StringVar(value=basename)
+            self.cur_file_path_label = tk.Label(self.right_frame, textvariable=self.cur_file_path_var)
+            self.cur_file_path_label.pack(side="top", fill="both")
         self.img = self.__get_image(filename)
 
     def __on_clear_shapes(self):
@@ -241,7 +345,8 @@ class ImageCropper:
                 deleted_item = self.drawed_shapes.pop(index)
                 # self.canvas.delete(deleted_item)
                 self.__canvas_delete_shape(deleted_item)
-                self.shapes.pop(index)
+                 
+                deleted_shape = self.shapes.pop(index)
                 self.shape_list.pop(index)
                 
             else:
@@ -250,11 +355,12 @@ class ImageCropper:
             self.__recreate_right_frame_item_by_shapes()
 
         self.cur_shape = None
-        self.__refresh_rectangle()
+        # self.__refresh_rectangle()
+
 
         
     
-    def __on_update_all_shapes(self):
+    def on_update_all_shapes(self):
         self.shapes = []
         discarded_shape = []
         for index, item in enumerate(self.shape_list):
@@ -278,20 +384,29 @@ class ImageCropper:
         if self.file_in_root_path is None:
             self.file_in_root_path = "./"
         files = filedialog.askopenfilenames(initialdir=self.file_in_root_path)
+
+        if not (isinstance(files, tuple) and len(files) > 0):
+            return
+        
         print("Selected files: ", files)
+        self.__show_img(files)
+    
+    def __show_img(self, files):
         if isinstance(files, tuple) and len(files) > 0:
             self.files = files
-            self.file_in_root_path = os.path.dirname(files[0])
+            self.file_in_root_path = os.path.dirname(files[self.img_index])
         
-        if not self.file_out_root_path:
-            self.file_out_root_path = self.file_in_root_path
+
+        self.file_out_root_path = self.file_in_root_path
         
         self.shapes = []
+        self.set_image(self.files[self.img_index])
+        self.__update_img_size()
+
         self.__recreate_right_frame_item_by_shapes()
         self.__refresh_rectangle()
         
-        self.set_image(self.files[0])
-        self.__update_img_size()
+        
     
     def __on_rectange_mode(self):
         print("rectange mode")
@@ -354,7 +469,8 @@ class ImageCropper:
         self.box[0], self.box[1] = event.x, event.y
         self.box[2], self.box[3] = event.x, event.y
         box = [event.x, event.y, event.x, event.y]
-        self.cur_shape = Shape(self.shape_name, box, self.default_line_width, self.default_color, self.arrow_cur_size)
+        current_color = self.__get_current_color()
+        self.cur_shape = Shape(self.shape_name, box, self.default_line_width, current_color, self.arrow_cur_size)
 
     def __on_mouse_release(self, event):
         print(abs(self.cur_shape.box[2] - self.cur_shape.box[0]) * abs(self.cur_shape.box[3] - self.cur_shape.box[1]))
@@ -393,8 +509,9 @@ class ImageCropper:
 
 
     def __on_mouse_move(self, event):
-        self.cur_shape.box[2] = event.x
-        self.cur_shape.box[3] = event.y
+        # self.cur_shape.box[2] = event.x
+        # self.cur_shape.box[3] = event.y
+        self.cur_shape.update_point2((event.x, event.y))
         # if self.shape_name == "矩形":
         self.__refresh_rectangle()
     
@@ -441,12 +558,12 @@ class ImageCropper:
    
     
     def __add_right_frame_item(self, shape):
-        item = RightFrameItem(self.right_frame, len(self.shape_list), shape, height=30, width=self.right_frame_width)
+        item = RightFrameItem(self, self.right_frame, len(self.shape_list), shape, height=30, width=self.right_frame_width, font_size=self.font_size)
         self.shape_list.append(item)
 
     
     def __recreate_right_frame_item_by_shapes(self):
-        for widget in self.right_frame.winfo_children():
+        for widget in self.right_frame.winfo_children()[1:]:
             widget.destroy()
         self.shape_list = []
         for shape in self.shapes:
@@ -461,6 +578,15 @@ class ImageCropper:
         path_root = filedialog.askdirectory(initialdir=self.file_out_root_path)
         self.save_images_with_rectange(path_root)
         self.save_images_with_arrow(path_root)
+        
+        # save user's colors to file
+        self.color_candidates = []
+        for shape in self.shapes:
+            self.color_candidates.append(shape.color)
+        
+        with open(self.color_path, "w", encoding="utf-8") as f:
+            for color in self.color_candidates:
+                f.write(f"{color}\n")
 
     
     def save_images_with_rectange(self, root_path):
@@ -495,6 +621,7 @@ class ImageCropper:
                     image_wrapper.draw_arrow_on_resized_image(shape)
                 elif shape.shape_name == "矩形":
                     image_wrapper.draw_rectange_on_origin_image(shape)
+                    image_wrapper.draw_rectange_on_resized_image(shape)
         
         index = 0
         for shape in self.shapes:
@@ -511,20 +638,29 @@ class ImageCropper:
 
             index += 1
 
-        path = os.path.join(root_path, "rectange")
-        if not os.path.exists(path):
-            os.makedirs(path)
+        # path = os.path.join(root_path, "rectange")
+        # if not os.path.exists(path):
+        #     os.makedirs(path)
 
-        for filename, image_wrapper in zip(self.files, images):
-            basename = os.path.basename(filename)
-            path = os.path.join(root_path, "rectange", basename)
-            image_wrapper.save_origin_image_with_rectange(path)
+        # for filename, image_wrapper in zip(self.files, images):
+        #     basename = os.path.basename(filename)
+        #     path = os.path.join(root_path, "rectange", basename)
+        #     image_wrapper.save_origin_image_with_rectange(path)
         
 
     def run(self):
         # self.roll_image()
         self.root.mainloop()
         # self.root.update()
+
+    
+    def __get_current_color(self):
+        if len(self.color_candidates) == 0:
+            return self.default_color
+        
+        self.color_index = self.color_index % len(self.color_candidates) + 1
+        
+        return self.color_candidates[self.color_index - 1]
 
 def arrow_coordinates(shape):
     point1 = [3, 0]
@@ -576,9 +712,11 @@ def get_angle(point1, point2):
 
 
 class RightFrameItem:
-    def __init__(self, master, index, shape, height, width) -> None:
+    def __init__(self, root_obj, master, index, shape, height, width, font_size) -> None:
+        self.root_obj = root_obj
+        self.index = index
         self.shape_name =shape.shape_name
-        font_size = font.Font(master, size=11)
+        font_size = font.Font(master, size=font_size)
         item_frame = tk.Frame(master,  height=height, width=width, bd=2)
         # item_frame2 = tk.Frame(master,  bg="#dbdbdb", height=3, width=width, bd=2)
         item_frame.pack(side="top", fill="both", pady=2)
@@ -597,44 +735,86 @@ class RightFrameItem:
 
         self.coord_label = tk.Label(item_frame,  text="坐标", font=font_size)
 
-        self.x1 = tk.Label(item_frame, text="x1:",  font=font_size)
-        self.x1_var = tk.IntVar(master, value=shape.box[0])
-        self.x1_entry = tk.Entry(item_frame, textvariable=self.x1_var, width=5, font=font_size)
+        self.x = tk.Label(item_frame, text="x:",  font=font_size)
+        self.x_var = tk.IntVar(master, value=shape.box[0])
+        self.x_entry = tk.Entry(item_frame, textvariable=self.x_var, width=5, font=font_size)
 
-        self.y1 = tk.Label(item_frame, text="y1:", font=font_size)
-        self.y1_var = tk.IntVar(master, value=shape.box[1])
-        self.y1_entry = tk.Entry(item_frame, textvariable=self.y1_var, width=5, font=font_size)
+        self.w = tk.Label(item_frame, text="w:", font=font_size)
+        self.w_var = tk.IntVar(master, value=shape.box[2] - shape.box[0])
+        self.w_entry = tk.Entry(item_frame, textvariable=self.w_var, width=5, font=font_size)
 
-        self.x2 = tk.Label(item_frame, text="x2:", font=font_size)
-        self.x2_var = tk.IntVar(master, value=shape.box[2])
-        self.x2_entry = tk.Entry(item_frame, textvariable=self.x2_var, width=5, font=font_size)
+        self.y = tk.Label(item_frame, text="y:", font=font_size)
+        self.y_var = tk.IntVar(master, value=shape.box[1])
+        self.y_entry = tk.Entry(item_frame, textvariable=self.y_var, width=5, font=font_size)
 
-        self.y2 = tk.Label(item_frame, text="y2:", font=font_size)
-        self.y2_var = tk.IntVar(master, value=shape.box[3])
-        self.y2_entry = tk.Entry(item_frame, textvariable=self.y2_var, width=5, font=font_size)
+        self.h = tk.Label(item_frame, text="h:", font=font_size)
+        self.h_var = tk.IntVar(master, value=shape.box[3] - shape.box[1])
+        self.h_entry = tk.Entry(item_frame, textvariable=self.h_var, width=5, font=font_size)
 
         self.selection_btn.grid(row=0, column=0)
         self.coord_label.grid(row=0, column=1)
-        self.x1.grid(row=0, column=2)
-        self.x1_entry.grid(row=0, column=3)
-        self.y1.grid(row=0, column=4, padx=(5, 0))
-        self.y1_entry.grid(row=0, column=5)
+        self.x.grid(row=0, column=2)
+        self.x_entry.grid(row=0, column=3)
+        self.w.grid(row=0, column=4, padx=(5, 0))
+        self.w_entry.grid(row=0, column=5)
         self.color_label1.grid(row=0, column=6, padx=(30, 10))
         self.color_entry.grid(row=0, column=7)
 
-        self.x2.grid(row=1, column=2)
-        self.x2_entry.grid(row=1, column=3)
-        self.y2.grid(row=1, column=4, padx=(5, 0))
-        self.y2_entry.grid(row=1, column=5)
+        self.y.grid(row=1, column=2)
+        self.y_entry.grid(row=1, column=3)
+        self.h.grid(row=1, column=4, padx=(5, 0))
+        self.h_entry.grid(row=1, column=5)
         self.line_width_label.grid(row=1, column=6, padx=(30, 10))
         self.line_width_entry.grid(row=1, column=7)
         self.arrow_size = shape.arrow_size
+
+        self.add_event()
+        self.old_color = shape.color
+    def add_event(self):
+        self.color_label1.bind("<Button>", self.__color_label_click)
+        self.color_entry.bind("<Return>", self.__on_color_change)
+
     
+    def __on_color_change(self, event):
+        def validate_color_code(color_code):
+            """
+            使用正则表达式验证颜色编码格式（#RRGGBB 或 #RGB）。
+
+            Args:
+                color_code: 要验证的颜色编码字符串。
+
+            Returns:
+                True 如果颜色编码格式正确，False 否则。
+            """
+            pattern = re.compile(r'^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{3})$')
+            return bool(pattern.match(color_code))
+
+        if validate_color_code(self.color_var.get()):
+            self.old_color = self.color_var.get()
+            self.root_obj.on_update_all_shapes()
+        else:
+            tk.messagebox.showinfo('错误',f'第{self.index}个颜色{self.color_var.get()}错误！')
+            self.color_var.set(self.old_color)
+
+
+        print(self.color_var.get())
+        
+
+    
+    def __color_label_click(self, event):
+        selected_colors = tk.colorchooser.askcolor(title='颜色选择器')
+        hex_color = selected_colors[1]
+        self.color_label1["bg"] = hex_color
+        self.color_var.set(hex_color)
+        self.root_obj.on_update_all_shapes()
+
+
+
     def is_selected(self):
         return self.bool_var.get()
     
     def to_shape(self):
-        box = (self.x1_var.get(), self.y1_var.get(), self.x2_var.get(), self.y2_var.get())
+        box = (self.x_var.get(), self.y_var.get(), self.x_var.get() + self.w_var.get(), self.y_var.get()+self.h_var.get())
         shape = Shape(self.shape_name, box, self.line_width_var.get(), self.color_var.get(), self.arrow_size)
         print(shape)
 
@@ -643,10 +823,35 @@ class RightFrameItem:
 class Shape:
     def __init__(self, shape_name, box, line_width, color, arrow_size):
         self.shape_name = shape_name
-        self.box = box
         self.line_width = line_width
         self.color = color
         self.arrow_size = arrow_size
+
+        if shape_name == "矩形":
+            x1 = min(box[0], box[2])
+            y1 = min(box[1], box[3])
+
+            x2 = max(box[0], box[2])
+            y2 = max(box[1], box[3])
+            self.point1 = box[:2]
+
+            self.box = [x1, y1, x2, y2]
+        else:
+            self.box = box
+    
+    def update_point2(self, point):
+        if self.shape_name == "矩形":
+            x1 = min(self.point1[0], point[0])
+            y1 = min(self.point1[1], point[1])
+
+            x2 = max(self.point1[0], point[0])
+            y2 = max(self.point1[1], point[1])
+
+            self.box = [x1, y1, x2, y2]
+        else:
+            self.box[2] = point[0]
+            self.box[3] = point[1]
+        
     
     def __str__(self):
         return f"{self.shape_name}: [{self.box}]  {self.line_width}  {self.color}"
@@ -691,13 +896,20 @@ class ImageWrapper:
             xys.append((arrow_coord[i], arrow_coord[i+1]))
         
         draw = ImageDraw.Draw(self.resized_img)
-        draw.line(box, fill=shape.color, width=shape.line_width*2)
+        # draw.line(box, fill=shape.color, width=shape.line_width*2)
+        draw.line(box, fill=shape.color, width=shape.line_width)
         draw.polygon(xys,  fill=shape.color, outline=shape.color, width=shape.line_width)
 
         # img = np.array(self.resized_img)
         # arrow_img = cv2.arrowedLine(img, shape.box[:2], shape.box[2:], color=hex_to_rgb(shape.color), thickness=shape.line_width, tipLength=0.2, line_type=cv2.LINE_AA)
         # self.resized_img = Image.fromarray(arrow_img)
+
+    def draw_rectange_on_resized_image(self, shape: Shape):
+        box = [(shape.box[0], shape.box[1]),
+               (shape.box[2], shape.box[3])]
         
+        draw = ImageDraw.Draw(self.resized_img)
+        draw.rectangle(box, outline=shape.color, width=shape.line_width)
     
     def draw_rectange_on_origin_image(self, shape: Shape):
         box = [(shape.box[0] * self.scale[0],
