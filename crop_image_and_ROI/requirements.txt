@@ -1,11 +1,5 @@
-Pillow==9.3.0
-tkinter
-customtkinter==5.2.2
+# Project dependencies pinned to the current Windows / Python 3.14.7 environment.
+Pillow==13.0.0
 
-from PIL import Image
-from PIL.ExifTags import TAGS
-import sys, os
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import ImageTk, ImageDraw
-import customtkinter
+# tkinter (Tk 9) is supplied by Python/Conda, not installed through pip.
+# All other imports, including unittest, are from the Python standard library.
