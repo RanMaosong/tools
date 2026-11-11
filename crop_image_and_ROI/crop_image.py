@@ -12,9 +12,10 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 from settings import CONFIG
+from high_depth import display_image
 from export_naming import layout_filename
 from image_core import (LayoutOptions, Panel, Shape, arrow_geometry, export_batch,
-                        import_panels, layout_plan, load_image, make_panels, render_layout, save_lossless, stroke_width)
+                        import_panels, layout_plan, linked_panel_keys, load_image, make_panels, move_panel_to, render_layout, save_lossless, stroke_width)
 
 IMAGE_TYPES = [("图像", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp"), ("所有文件", "*.*")]
 MODES = {"按 ROI 相对位置": "relative", "原图上 / ROI 下": "below", "原图左 / ROI 右": "right", "原图一行 / ROI 分行": "rows", "自由混排（逐张排序）": "free"}
@@ -36,6 +37,9 @@ class ImageCropper:
         self.files, self.shapes, self.panels, self.import_files = [], [], [], []
         self.extra_images = []
         self.method_names = {}
+        self.layout_offsets = {}
+        self.layout_position_key = None
+        self.layout_placements = {}
         self.roi_layout_vars, self.roi_setting_shapes = {}, []
         self.index, self.rotation = 0, 0
         self.import_rotation = 0
@@ -84,6 +88,27 @@ class ImageCropper:
         self.root.bind("<Button-1>", self._blank_area_click, add="+")
         self.root.bind("<Left>", lambda event: self._navigate_key(event, -1))
         self.root.bind("<Right>", lambda event: self._navigate_key(event, 1))
+        self._bind_editor_navigation()
+        self.notebook.bind("<<NotebookTabChanged>>", self._focus_editor_canvas)
+
+    def _bind_editor_navigation(self):
+        # A toplevel binding runs after widget class bindings. In particular,
+        # TNotebook consumes arrows before that binding can turn the image.
+        tag = f"ImageNavigation:{id(self)}"
+        self.root.bind_class(tag, "<Left>", lambda event: self._navigate_key(event, -1))
+        self.root.bind_class(tag, "<Right>", lambda event: self._navigate_key(event, 1))
+
+        def install(widget):
+            tags = widget.bindtags()
+            widget.bindtags((tags[0], tag, *tags[1:]))
+            for child in widget.winfo_children():
+                install(child)
+
+        install(self.root)
+
+    def _focus_editor_canvas(self, event=None):
+        if self.notebook.select() == str(self.edit_tab):
+            self.canvas.focus_set()
 
     def _build_editor(self):
         bar = ttk.Frame(self.edit_tab, padding=UI["space"])
@@ -130,8 +155,8 @@ class ImageCropper:
             self.canvas.bind(event, command)
         nav = ttk.Frame(image_frame)
         nav.pack(fill="x")
-        self._button(nav, "上一张", lambda: self.navigate(-1))
-        self._button(nav, "下一张", lambda: self.navigate(1))
+        self._button(nav, "上一张 (←)", lambda: self.navigate(-1))
+        self._button(nav, "下一张 (→)", lambda: self.navigate(1))
         self.file_label = ttk.Label(nav, text="未打开图像")
         self.file_label.pack(side="left", padx=UI["space_outer"])
         sidebar.columnconfigure(0, weight=1)
@@ -254,21 +279,43 @@ class ImageCropper:
         self.order_list.bind("<Control-a>", lambda e: self.select_order("all"))
         self.order_list.bind("<Control-A>", lambda e: self.select_order("all"))
         self.order_list.bind("<Escape>", lambda e: self.select_order("none"))
+        self.order_list.bind("<<ListboxSelect>>", self._position_from_order)
+        self.blank_button = ttk.Button(left, text="添加空白图", command=self.add_blank)
+        self.blank_button.grid(row=2, column=0, sticky="ew", pady=UI["space_xs"])
         selection_actions = ttk.Frame(left)
-        selection_actions.grid(row=2, column=0, sticky="ew")
+        selection_actions.grid(row=3, column=0, sticky="ew")
         self._button(selection_actions, "全选", lambda: self.select_order("all"))
         self._button(selection_actions, "仅选附加图", lambda: self.select_order("extra"))
         self._button(selection_actions, "取消选择", lambda: self.select_order("none"))
         move = ttk.Frame(left)
-        move.grid(row=3, column=0, sticky="ew")
+        move.grid(row=4, column=0, sticky="ew")
         self._button(move, "上移", lambda: self.move_order(-1))
         self._button(move, "下移", lambda: self.move_order(1))
         rotation_actions = ttk.Frame(left)
-        rotation_actions.grid(row=4, column=0, sticky="ew")
+        rotation_actions.grid(row=5, column=0, sticky="ew")
         self._button(rotation_actions, "批量左转 90°", lambda: self.rotate_extra(90))
         self._button(rotation_actions, "批量右转 90°", lambda: self.rotate_extra(-90))
         self._button(move, "移除所选素材", self.remove_panel)
-        ttk.Label(left, text="Ctrl / Shift 多选，Ctrl+A 全选。\n批量旋转仅处理附加图。\n选中条目可批量移动、移除。\nROI 边距：正数向内，负数向外。", wraplength=UI["layout_help_wrap_width"], justify="left").grid(row=5, column=0, sticky="w", pady=UI["space_lg"])
+        ttk.Label(left, text="Ctrl / Shift 多选，Ctrl+A 全选。\n批量旋转仅处理附加图。\n选中条目可批量移动、移除。\nROI 边距：正数向内，负数向外。", wraplength=UI["layout_help_wrap_width"], justify="left").grid(row=6, column=0, sticky="w", pady=UI["space_lg"])
+        position_box = ttk.LabelFrame(right, text="选中图片位置（最终导出像素）", padding=UI["space"])
+        position_box.pack(fill="x", padx=UI["space"], pady=UI["space"])
+        self.layout_position_text = tk.StringVar(value="点击预览中的图片，查看和修改它的位置。")
+        ttk.Label(position_box, textvariable=self.layout_position_text, width=UI["list_width"]).grid(row=0, column=0, columnspan=7, sticky="ew")
+        self.layout_position_vars = {axis: tk.StringVar() for axis in ("x", "y")}
+        self.layout_position_entries = {}
+        for column, (axis, text) in enumerate((("x", "距左(px)"), ("y", "距上(px)"))):
+            ttk.Label(position_box, text=text).grid(row=1, column=column*2, padx=UI["space_xs"])
+            entry = ttk.Entry(position_box, textvariable=self.layout_position_vars[axis], width=UI["layout_input_width"])
+            entry.grid(row=1, column=column*2+1, padx=UI["space_sm"], pady=UI["space_sm"])
+            entry.bind("<Return>", self.apply_layout_position)
+            entry.bind("<KP_Enter>", self.apply_layout_position)
+            self.layout_position_entries[axis] = entry
+        self.position_apply_button = ttk.Button(position_box, text="应用位置", command=self.apply_layout_position, state="disabled")
+        self.position_apply_button.grid(row=1, column=4, padx=UI["space_sm"])
+        self.position_reset_button = ttk.Button(position_box, text="恢复所选位置", command=self.reset_layout_position, state="disabled")
+        self.position_reset_button.grid(row=1, column=5, padx=UI["space_sm"])
+        self.position_reset_all_button = ttk.Button(position_box, text="全部恢复自动", command=lambda: self.reset_layout_position(all_images=True), state="disabled")
+        self.position_reset_all_button.grid(row=1, column=6, padx=UI["space_sm"])
         self.preview = tk.Canvas(right, background="#E4E8ED", highlightthickness=0)
         self.preview.pack(fill="both", expand=True)
         for event, command in (("<Configure>", self._schedule_preview), ("<Button-1>", self._preview_start),
@@ -458,6 +505,8 @@ class ImageCropper:
         self.shapes, self.panels, self.import_files = [], [], []
         self.extra_images = []
         self.method_names = {}
+        self.layout_offsets = {}
+        self.layout_position_key = None
         self.generated = self.dirty_panels = False
         self._refresh_roi_controls(reset=True)
         self._refresh_shapes()
@@ -465,6 +514,7 @@ class ImageCropper:
         self._show_image()
         self.update_preview()
         self.notebook.select(self.edit_tab)
+        self._focus_editor_canvas()
 
     def add_files(self):
         if self.busy:
@@ -533,11 +583,15 @@ class ImageCropper:
             # Panel keys use file indices; remap them with the filenames so a
             # title or ROI can never become attached to a different method.
             positions = {path: str(i) for i, path in enumerate(self.files)}
+            key_map = {p.key: p.key for p in self.panels}
             for panel in self.panels:
                 if panel.kind == "extra":
                     continue
+                old_key = panel.key
                 panel.group = positions[previous[int(panel.group)]]
                 panel.key = f"{panel.group}:{panel.kind}"
+                key_map[old_key] = panel.key
+            self._remap_layout_offsets(key_map, {p.key for p in self.panels})
             source_panels = iter(sorted((p for p in self.panels if p.kind != "extra"), key=lambda p: int(p.group)))
             self.panels = [p if p.kind == "extra" else next(source_panels) for p in self.panels]
             self._refresh_order()
@@ -601,8 +655,14 @@ class ImageCropper:
             return
         if event.widget.winfo_class() in ("Entry", "TEntry", "Spinbox", "TSpinbox", "Text", "TCombobox"):
             return
-        if getattr(event, "state", 0) & (0x0004 | 0x0008):
+        # Tk uses 0x0008 for Num Lock on Windows, while Alt is 0x20000.
+        # Treating the X11 Alt bit as universal disables ordinary arrow keys
+        # whenever Num Lock is enabled (including native extended-key events).
+        alt_mask = 0x20000 if self.root.tk.call("tk", "windowingsystem") == "win32" else 0x0008
+        if getattr(event, "state", 0) & (0x0004 | alt_mask):
             return
+        if self.busy or self.drawing is not None:
+            return "break"
         self.navigate(step)
         return "break"
 
@@ -637,7 +697,7 @@ class ImageCropper:
         scale = max(EDITOR["minimum_view_scale"], min((cw-EDITOR["canvas_padding"])/self.image.width, (ch-EDITOR["canvas_padding"])/self.image.height))
         w, h = max(1, round(self.image.width*scale)), max(1, round(self.image.height*scale))
         self.offset, self.display_size = ((cw-w)//2, (ch-h)//2), (w, h)
-        self.photo = ImageTk.PhotoImage(self.image.resize((w, h), Image.Resampling.LANCZOS))
+        self.photo = ImageTk.PhotoImage(display_image(self.image).resize((w, h), Image.Resampling.LANCZOS))
         self.canvas.create_image(*self.offset, anchor="nw", image=self.photo)
         self._draw_shapes()
 
@@ -684,6 +744,7 @@ class ImageCropper:
         # their selection so editing/applying an annotation still works.
         if event.widget.winfo_class() in ("Tk", "TFrame", "Frame", "TLabelframe", "Labelframe"):
             self.clear_shape_selection()
+            self._focus_editor_canvas()
 
     def _point(self, event, clamp=True):
         w, h = self.display_size
@@ -696,6 +757,7 @@ class ImageCropper:
         self.clear_shape_selection()
         if self.image is None or self.busy:
             return
+        self.canvas.focus_set()
         point = self._point(event, False)
         if point is None:
             return
@@ -850,10 +912,17 @@ class ImageCropper:
         def done(panels):
             order = {p.key: i for i, p in enumerate(self.panels)}
             titles = {p.key: p.title for p in self.panels}
+            rectangles = [shape for shape in shapes if shape.kind == "rectangle"]
+            kind_map = {f"roi-{i}": f"roi-{j}" for i, old in enumerate(self.roi_setting_shapes)
+                        for j, current in enumerate(rectangles) if old is current}
+            key_map = {p.key: p.key for p in self.panels if p.kind in ("original", "extra")}
+            if self.generated:
+                key_map.update({p.key: f"{p.group}:{kind_map[p.kind]}" for p in self.panels if p.kind in kind_map})
             panels.extend(p for p in self.panels if p.kind == "extra")
             panels.sort(key=lambda p: order.get(p.key, len(order)))
             for panel in panels:
                 panel.title = titles.get(panel.key, panel.title)
+            self._remap_layout_offsets(key_map, {p.key for p in panels})
             self.panels = panels
             self.generated, self.dirty_panels = True, False
             self.labels.set(False)
@@ -878,19 +947,47 @@ class ImageCropper:
             raise ValueError("附加图片记录必须为列表")
         seen, panels = set(), []
         for item in records:
-            if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not item["key"].startswith("extra:") or not isinstance(item.get("path"), str):
+            if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not item["key"].startswith("extra:"):
                 raise ValueError("附加图片记录无效")
-            key, path = item["key"], item["path"]
+            key = item["key"]
             if key in seen:
                 raise ValueError("附加图片标识重复")
             rotation = item.get("rotation", 0)
             if type(rotation) is not int or rotation not in (0, 90, 180, 270):
                 raise ValueError("附加图片旋转角度必须为 0、90、180 或 270")
             seen.add(key)
+            item_type = item.get("type", "image")
+            if item_type == "blank":
+                size = item.get("size")
+                if not isinstance(size, (list, tuple)) or len(size) != 2 or any(type(value) is not int or not 1 <= value <= LIMITS["panel_width_max"] for value in size) or rotation != 0:
+                    raise ValueError("空白图尺寸或旋转参数无效")
+                # A one-pixel backing avoids allocating a full image per
+                # placeholder; the renderer fills the cell at output size.
+                panels.append(Panel(key, key, "extra", "空白图", Image.new("RGB", (1, 1)), blank_size=tuple(size)))
+                continue
+            if item_type != "image" or not isinstance(item.get("path"), str):
+                raise ValueError("附加图片路径或类型无效")
+            path = item["path"]
             # Use each image's saved rotation; never infer annotations or ROI
             # membership from its filename or apply the editor rotation twice.
             panels.append(Panel(key, key, "extra", Path(path).stem, load_image(path, rotation)))
         return panels
+
+    def add_blank(self):
+        if self.busy:
+            return
+        size = self.image.size if self.image is not None else (LAYOUT["blank_width"], LAYOUT["blank_height"])
+        record = {"key": f"extra:{uuid.uuid4().hex}", "type": "blank", "size": list(size), "rotation": 0}
+        panel = self._load_extra_panels([record])[0]
+        units = self._order_units()
+        selected = self.order_list.curselection()
+        index = max(selected)+1 if selected else len(units)
+        units.insert(index, [panel])
+        self.panels = [item for unit in units for item in unit]
+        self.extra_images.append(record)
+        self._refresh_order(index)
+        self.update_preview()
+        self.status.set("已插入透明空白占位；可拖动排序或移除，重叠时不遮挡图片，尺寸随排版设置更新。")
 
     def append_images(self):
         if self.busy:
@@ -898,7 +995,7 @@ class ImageCropper:
         files = filedialog.askopenfilenames(title="追加残差图等独立图片（不生成 ROI）", filetypes=IMAGE_TYPES)
         if not files:
             return
-        existing = {str(Path(item["path"]).resolve()).casefold() for item in self.extra_images}
+        existing = {str(Path(item["path"]).resolve()).casefold() for item in self.extra_images if item.get("type") != "blank"}
         records = []
         for filename in files:
             path = str(Path(filename).resolve())
@@ -937,6 +1034,8 @@ class ImageCropper:
             self.import_rotation = rotation
             self.extra_images = []
             self.method_names = {}
+            self.layout_offsets = {}
+            self.layout_position_key = None
             self.generated = self.dirty_panels = False
             self.labels.set(False)
             self._refresh_roi_controls(reset=True)
@@ -957,6 +1056,7 @@ class ImageCropper:
             except ValueError as error:
                 raise ValueError(f"{self._anchor_label(kind)} 的宽、高和边距必须输入整数像素") from error
         result = LayoutOptions(mode=MODES[self.layout_mode.get()], **values, labels=False, roi_settings=settings,
+                               panel_offsets={key: dict(value) for key, value in self.layout_offsets.items()},
                                interpolation="nearest" if self.interpolation.get().startswith("像素") else "lanczos", background=self.background)
         result.validate()
         return result
@@ -1115,7 +1215,7 @@ class ImageCropper:
             if alias and alias != unit[0].title:
                 title = alias + " | " + title
             if unit[0].kind == "extra":
-                title += "（附加图，无 ROI）"
+                title += "（空白占位）" if unit[0].blank_size is not None else "（附加图，无 ROI）"
                 rotation = rotations.get(unit[0].key, 0)
                 if rotation:
                     title += {90: " 左转90°", 180: " 旋转180°", 270: " 右转90°"}[rotation]
@@ -1137,13 +1237,14 @@ class ImageCropper:
             self.order_list.selection_set(0, "end")
         elif scope == "extra":
             for i, unit in enumerate(self._order_units()):
-                if any(p.kind == "extra" for p in unit):
+                if any(p.kind == "extra" and p.blank_size is None for p in unit):
                     self.order_list.selection_set(i)
         selected = self.order_list.curselection()
         if selected:
             self.order_list.selection_anchor(selected[0])
             self.order_list.activate(selected[0])
         self.order_list.focus_set()
+        self._position_from_order()
         return "break"
 
     def rotate_extra(self, angle):
@@ -1155,7 +1256,7 @@ class ImageCropper:
             return
         units = self._order_units()
         selected_keys = {p.key for index in selection for p in units[index]}
-        targets = {p.key: p for index in selection for p in units[index] if p.kind == "extra"}
+        targets = {p.key: p for index in selection for p in units[index] if p.kind == "extra" and p.blank_size is None}
         if not targets:
             self.status.set("批量旋转用于残差图等附加图片，请选中附加图。")
             return
@@ -1284,9 +1385,71 @@ class ImageCropper:
             units = [unit for i, unit in enumerate(units) if i not in selection]
             self.panels = [p for unit in units for p in unit]
             self.extra_images = [item for item in self.extra_images if item["key"] not in removed]
+            self.layout_offsets = {key: value for key, value in self.layout_offsets.items() if key not in removed}
             self._refresh_roi_controls()
             self._refresh_order()
             self.update_preview()
+
+    def _remap_layout_offsets(self, key_map, valid_keys):
+        self.layout_offsets = {key_map[key]: value for key, value in self.layout_offsets.items()
+                               if key in key_map and key_map[key] in valid_keys}
+        self.layout_position_key = key_map.get(self.layout_position_key)
+
+    def _sync_layout_position(self):
+        self.preview.delete("position-selection")
+        item = self.layout_placements.get(self.layout_position_key)
+        if item is None:
+            if not any(p.key == self.layout_position_key for p in self.panels):
+                self.layout_position_key = None
+            self.layout_position_text.set("点击预览中的图片，查看和修改它的位置。")
+            for variable in self.layout_position_vars.values():
+                variable.set("")
+        else:
+            linked = linked_panel_keys(self.panels, self.layout_position_key)
+            suffix = "  ·  同组 ROI 随原图移动" if len(linked) > 1 else ""
+            self.layout_position_text.set(f"{item.panel.title}  ·  {item.width} × {item.height} px{suffix}")
+            self.layout_position_vars["x"].set(str(item.x))
+            self.layout_position_vars["y"].set(str(item.y))
+            for key, box in self.preview_hits:
+                if key in linked:
+                    self.preview.create_rectangle(*box, outline="#2475D0", width=LAYOUT["drop_outline_width"], tags="position-selection")
+        self.position_apply_button.configure(state="normal" if item is not None else "disabled")
+        self.position_reset_button.configure(state="normal" if item is not None else "disabled")
+        self.position_reset_all_button.configure(state="normal" if self.layout_offsets else "disabled")
+
+    def _position_from_order(self, event=None):
+        units = self._order_units()
+        selected = [i for i in self.order_list.curselection() if i < len(units)]
+        keys = {p.key for i in selected for p in units[i]}
+        if self.layout_position_key not in keys:
+            self.layout_position_key = units[selected[0]][0].key if selected else None
+        self._sync_layout_position()
+
+    def apply_layout_position(self, event=None):
+        if self.busy or self.layout_position_key is None:
+            return "break"
+        try:
+            try:
+                x, y = (int(self.layout_position_vars[axis].get()) for axis in ("x", "y"))
+            except ValueError as error:
+                raise ValueError("距左、距上请输入整数像素，可以输入负数。") from error
+            updated = move_panel_to(self.panels, self.options(), self.layout_position_key, x, y)
+            self.layout_offsets = updated.panel_offsets
+            self.update_preview()
+            self.status.set("图片位置已更新；若出现负坐标，已按所有图片最左、最上的边缘重新计算原点。")
+        except (ValueError, tk.TclError) as error:
+            self._fail(error)
+        return "break"
+
+    def reset_layout_position(self, all_images=False):
+        if self.busy:
+            return
+        if all_images:
+            self.layout_offsets = {}
+        else:
+            for key in linked_panel_keys(self.panels, self.layout_position_key):
+                self.layout_offsets.pop(key, None)
+        self.update_preview()
 
     def _schedule_preview(self, *args):
         if self.preview_after:
@@ -1301,11 +1464,16 @@ class ImageCropper:
             self.preview_after = None
         self.preview.delete("all")
         self.preview_hits = []
+        self.layout_placements = {}
         if not self.panels:
             self.preview.create_text(max(UI["layout_hint_min_x"], self.preview.winfo_width()//2), max(UI["layout_hint_min_y"], self.preview.winfo_height()//2), text="生成排版素材，或导入已有的画框图与 ROI", fill="#566577", font=("Microsoft YaHei UI", UI["layout_hint_font_size"]))
+            self._sync_layout_position()
             return
         try:
-            image, size, hits = render_layout(self.panels, self.options(), (max(LAYOUT["preview_min_size"], self.preview.winfo_width()-LAYOUT["preview_padding"]), max(LAYOUT["preview_min_size"], self.preview.winfo_height()-LAYOUT["preview_padding"])))
+            options = self.options()
+            plan, _ = layout_plan(self.panels, options)
+            image, size, hits = render_layout(self.panels, options, (max(LAYOUT["preview_min_size"], self.preview.winfo_width()-LAYOUT["preview_padding"]), max(LAYOUT["preview_min_size"], self.preview.winfo_height()-LAYOUT["preview_padding"])))
+            self.layout_placements = {item.panel.key: item for item in plan}
             ox, oy = (self.preview.winfo_width()-image.width)//2, (self.preview.winfo_height()-image.height)//2
             self.layout_photo = ImageTk.PhotoImage(image)
             self.preview.create_image(ox, oy, anchor="nw", image=self.layout_photo)
@@ -1313,24 +1481,42 @@ class ImageCropper:
             self.layout_info.configure(text=f"导出 {size[0]} × {size[1]} px  |  {len(self.panels)} 张素材  |  预览已缩放")
         except (ValueError, OSError, MemoryError) as error:
             self.layout_info.configure(text=f"无法排版：{error}")
+        self._sync_layout_position()
+
+    def _hit_panel(self, event):
+        # Later images are painted on top, including ROIs over an original.
+        blank_keys = {panel.key for panel in self.panels if panel.blank_size is not None}
+        blank_hit = None
+        for key, (x1, y1, x2, y2) in reversed(self.preview_hits):
+            if x1 <= event.x < x2 and y1 <= event.y < y2:
+                if key in blank_keys:
+                    if blank_hit is None:
+                        blank_hit = key
+                    continue
+                return key
+        return blank_hit
 
     def _hit(self, event):
-        for key, (x1, y1, x2, y2) in self.preview_hits:
-            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
-                for i, unit in enumerate(self._order_units()):
-                    if any(p.key == key for p in unit):
-                        return i
+        key = self._hit_panel(event)
+        for i, unit in enumerate(self._order_units()):
+            if any(p.key == key for p in unit):
+                return i
         return None
 
     def _preview_start(self, event):
+        if self.busy:
+            return
+        self.layout_position_key = self._hit_panel(event)
         self.drag_index = self._hit(event)
         if self.drag_index is None:
             self.clear_shape_selection()
+            self.select_order("none")
         if self.drag_index is not None:
             selection = self.order_list.curselection()
             self.order_drag_selection = selection if self.drag_index in selection else (self.drag_index,)
             self._refresh_order(self.order_drag_selection)
             self.preview.configure(cursor="fleur")
+        self._sync_layout_position()
 
     def _preview_motion(self, event):
         self.preview.delete("drop")
@@ -1451,6 +1637,9 @@ class ImageCropper:
             self.import_rotation = import_rotation
             self.extra_images = [item for item in extras if any(p.key == item["key"] for p in panels)]
             self.method_names = method_names
+            valid_keys = {p.key for p in panels}
+            self.layout_offsets = {key: value for key, value in options.panel_offsets.items() if key in valid_keys}
+            self.layout_position_key = None
             for key, var in self.layout_vars.items():
                 var.set(str(getattr(options, key)))
             self.layout_mode.set(next(name for name, mode in MODES.items() if mode == options.mode))

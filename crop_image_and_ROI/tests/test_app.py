@@ -8,6 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image
+import numpy as np
+from high_depth import Image16
 from crop_image import ImageCropper, MODES, HORIZONTAL_EDGES, VERTICAL_EDGES
 from image_core import Shape, arrow_geometry, layout_plan, make_panels, render_layout
 
@@ -59,6 +61,42 @@ class AppTests(unittest.TestCase):
             self.app.append_images()
         self.finish()
         return [p for p in self.app.panels if p.kind == "extra"]
+
+    def test_16bit_editor_preview_rotation_layout_export_and_project_restore(self):
+        app = self.app
+        pixels = ((np.arange(40*30, dtype=np.uint32)*53+1) % 65536).astype(np.uint16).reshape(30, 40)
+        path = self.path / "gt.png"
+        Image.fromarray(pixels).save(path)
+        original_bytes = path.read_bytes()
+        app._replace_files([str(path)])
+        self.assertIsInstance(app.image, Image16)
+        np.testing.assert_array_equal(app.image.pixels[:, :, 0], pixels)
+        app.draw_image()
+        self.assertIsNotNone(app.photo)
+        app.rotate(90)
+        np.testing.assert_array_equal(app.image.pixels[:, :, 0], np.rot90(pixels))
+        self.generate()
+        self.assertTrue(all(isinstance(panel.image, Image16) for panel in app.panels))
+        app.update_preview()
+        expected, size, _ = render_layout(app.panels, app.options())
+        output = self.path / "16bit-layout.png"
+        with patch("crop_image.filedialog.asksaveasfilename", return_value=str(output)):
+            app.export_layout()
+        self.finish()
+        self.assertEqual(output.read_bytes()[24], 16)
+        from image_core import load_image
+        saved = load_image(output)
+        self.assertEqual(saved.size, size)
+        np.testing.assert_array_equal(saved.pixels, expected.pixels)
+        project = self.path / "16bit-project.json"
+        before = [p.image.tobytes() for p in app.panels]
+        with patch("crop_image.filedialog.asksaveasfilename", return_value=str(project)):
+            app.save_project()
+        with patch("crop_image.filedialog.askopenfilename", return_value=str(project)):
+            app.open_project()
+        self.assertFalse(self.errors, self.errors)
+        self.assertEqual([p.image.tobytes() for p in app.panels], before)
+        self.assertEqual(path.read_bytes(), original_bytes)
 
     def test_reverse_drawing_and_resize_keep_normalized_coordinates(self):
         app = self.app
@@ -247,8 +285,8 @@ class AppTests(unittest.TestCase):
 
     def test_invalid_addition_is_atomic_and_cancel_leaves_files_unchanged(self):
         app = self.app
-        invalid = self.path / "high-bit.png"
-        Image.new("I;16", (20, 10), 32000).save(invalid)
+        invalid = self.path / "floating-point.tif"
+        Image.new("F", (20, 10), -1.5).save(invalid)
         good = self.path / "good.png"
         Image.new("RGB", (20, 10)).save(good)
         with patch.object(app, "_fail") as fail:
@@ -312,6 +350,207 @@ class AppTests(unittest.TestCase):
         self.assertFalse(self.errors, self.errors)
         self.assertEqual(len(app.panels), 2)
         self.assertEqual(app.panels[0].image.size, (200, 100))
+
+    def test_preview_click_edits_specific_roi_and_rebases_all_coordinates_on_return(self):
+        self.generate()
+        app = self.app
+        self.root.deiconify()
+        self.root.update()
+        app.update_preview()
+        key = "0:roi-0"
+        box = next(box for panel_key, box in app.preview_hits if panel_key == key)
+        x, y = round((box[0]+box[2])/2), round((box[1]+box[3])/2)
+        app.preview.event_generate("<ButtonPress-1>", x=x, y=y)
+        app.preview.event_generate("<ButtonRelease-1>", x=x, y=y)
+        self.root.update()
+        self.assertEqual(app.layout_position_key, key)
+        item = app.layout_placements[key]
+        self.assertEqual((app.layout_position_vars["x"].get(), app.layout_position_vars["y"].get()), (str(item.x), str(item.y)))
+        self.assertTrue(app.preview.find_withtag("position-selection"))
+        before = {key: (p.x, p.y) for key, p in app.layout_placements.items()}
+        pixels = {p.key: p.image.tobytes() for p in app.panels}
+        app.layout_position_vars["x"].set("-25")
+        app.layout_position_vars["y"].set("-10")
+        entry = app.layout_position_entries["x"]
+        entry.focus_force()
+        self.root.update()
+        entry.event_generate("<Return>")
+        self.root.update()
+        self.assertFalse(self.errors, self.errors)
+        self.assertEqual((app.layout_position_vars["x"].get(), app.layout_position_vars["y"].get()), ("0", "0"))
+        for other, position in app.layout_placements.items():
+            wanted = (0, 0) if other == key else (before[other][0]+25, before[other][1]+10)
+            self.assertEqual((position.x, position.y), wanted)
+        self.assertEqual({p.key: p.image.tobytes() for p in app.panels}, pixels)
+        app.layout_position_vars["x"].set("50")
+        app.layout_position_vars["y"].set("40")
+        app.position_apply_button.invoke()
+        self.assertEqual((app.layout_placements[key].x, app.layout_placements[key].y), (50, 40))
+        app.position_reset_all_button.invoke()
+        self.assertEqual(app.layout_offsets, {})
+        self.assertEqual((app.layout_placements[key].x, app.layout_placements[key].y), before[key])
+
+    def test_layout_positions_follow_source_reorder_roi_renumber_and_project_restore(self):
+        app = self.app
+        app.shapes = [Shape("rectangle", (.1, .2, .6, .8)), Shape("rectangle", (.3, .3, .7, .7))]
+        app.generate_panels()
+        self.finish()
+        app.layout_position_key = "0:roi-1"
+        app.layout_position_vars["x"].set("140")
+        app.layout_position_vars["y"].set("90")
+        app.apply_layout_position()
+        offset = dict(app.layout_offsets["0:roi-1"])
+        app._reorder_files(0, 2)
+        self.assertNotIn("0:roi-1", app.layout_offsets)
+        self.assertEqual(app.layout_offsets["2:roi-1"], offset)
+        app._refresh_shapes()
+        app.shape_tree.selection_set("0")
+        app.delete_shapes()
+        app.generate_panels()
+        self.finish()
+        self.assertNotIn("2:roi-1", app.layout_offsets)
+        self.assertEqual(app.layout_offsets["2:roi-0"], offset)
+        before = dict(app.layout_offsets)
+        project = self.path / "positions.json"
+        with patch("crop_image.filedialog.asksaveasfilename", return_value=str(project)):
+            app.save_project()
+        app.layout_offsets = {}
+        with patch("crop_image.filedialog.askopenfilename", return_value=str(project)):
+            app.open_project()
+        self.assertFalse(self.errors, self.errors)
+        self.assertEqual(app.layout_offsets, before)
+        app.select_order("all")
+        app.remove_panel()
+        self.assertEqual(app.layout_offsets, {})
+
+    def test_invalid_layout_position_keeps_previous_position_and_empty_click_deselects(self):
+        self.generate()
+        app = self.app
+        app.layout_position_key = "0:original"
+        app._sync_layout_position()
+        app.layout_position_vars["x"].set("invalid")
+        with patch.object(app, "_fail") as fail:
+            app.apply_layout_position()
+            fail.assert_called_once()
+        self.assertEqual(app.layout_offsets, {})
+        app._preview_start(SimpleNamespace(x=-10000, y=-10000))
+        self.assertIsNone(app.layout_position_key)
+        self.assertEqual(app.layout_position_vars["x"].get(), "")
+
+    def test_original_position_moves_its_roi_and_transparent_blank_does_not_block_selection(self):
+        self.generate()
+        app = self.app
+        app.layout_position_key = "0:original"
+        app._sync_layout_position()
+        before = {key: (item.x, item.y) for key, item in app.layout_placements.items()}
+        app.layout_position_vars["x"].set("25")
+        app.layout_position_vars["y"].set("35")
+        app.apply_layout_position()
+        for key, item in app.layout_placements.items():
+            expected = (before[key][0]+25, before[key][1]+35) if key.startswith("0:") else before[key]
+            self.assertEqual((item.x, item.y), expected)
+        self.assertEqual(len(app.preview.find_withtag("position-selection")), 2)
+        app.position_reset_button.invoke()
+        self.assertEqual(app.layout_offsets, {})
+        app.add_blank()
+        blank = next(p for p in app.panels if p.blank_size is not None)
+        app.layout_position_key = blank.key
+        app.layout_position_vars["x"].set("0")
+        app.layout_position_vars["y"].set("0")
+        app.apply_layout_position()
+        rendered, _, _ = render_layout(app.panels, app.options())
+        without_blank, _, _ = render_layout([p for p in app.panels if p.blank_size is None], app.options())
+        self.assertEqual(rendered.tobytes(), without_blank.tobytes())
+        box = next(box for key, box in app.preview_hits if key == "0:original")
+        event = SimpleNamespace(x=box[0]+(box[2]-box[0])*.9, y=box[1]+(box[3]-box[1])*.9)
+        self.assertEqual(app._hit_panel(event), "0:original")
+        # A transparent overlapping placeholder remains editable via the list.
+        unit = next(i for i, unit in enumerate(app._order_units()) if unit[0].key == blank.key)
+        app.order_list.selection_clear(0, "end")
+        app.order_list.selection_set(unit)
+        app._position_from_order()
+        self.assertEqual(app.layout_position_key, blank.key)
+
+    def test_blank_button_inserts_after_selection_and_follows_layout_size_and_background(self):
+        self.generate()
+        app = self.app
+        before = {p.key: p.image.tobytes() for p in app.panels}
+        app.order_list.selection_set(0)
+        app.blank_button.invoke()
+        units = app._order_units()
+        self.assertEqual(len(units), 4)
+        blank = units[1][0]
+        self.assertIsNotNone(blank.blank_size)
+        self.assertEqual(app.order_list.curselection(), (1,))
+        self.assertIn("空白占位", app.order_list.get(1))
+        app.background = "#123456"
+        app.layout_vars["panel_width"].set("400")
+        plan, _ = layout_plan(app.panels, app.options())
+        cell = next(item for item in plan if item.panel.key == blank.key)
+        self.assertEqual((cell.width, cell.height), (400, 200))
+        rendered, _, _ = render_layout(app.panels, app.options())
+        region = rendered.crop((cell.x, cell.y, cell.x+cell.width, cell.y+cell.height))
+        self.assertEqual(region.convert("RGB").getextrema(), ((18, 18), (52, 52), (86, 86)))
+        for panel in app.panels:
+            if panel.key in before:
+                self.assertEqual(panel.image.tobytes(), before[panel.key])
+
+    def test_blank_survives_append_refresh_reorder_project_restore_and_removal(self):
+        self.generate()
+        app = self.app
+        app.add_blank()
+        blank = next(p for p in app.panels if p.blank_size is not None)
+        self.append_test_extras(1)
+        app._reorder(3, 0)
+        app.select_order("all")
+        app.rotate_extra(90)
+        self.finish()
+        self.assertEqual(next(r for r in app.extra_images if r["key"] == blank.key)["rotation"], 0)
+        app.generate_panels()
+        self.finish()
+        self.assertEqual(app.panels[0].key, blank.key)
+        keys = [p.key for p in app.panels]
+        project = self.path / "with-blank.json"
+        with patch("crop_image.filedialog.asksaveasfilename", return_value=str(project)):
+            app.save_project()
+        record = next(r for r in json.loads(project.read_text(encoding="utf-8"))["extra_images"] if r["type"] == "blank")
+        self.assertNotIn("path", record)
+        with patch("crop_image.filedialog.askopenfilename", return_value=str(project)):
+            app.open_project()
+        self.assertFalse(self.errors, self.errors)
+        self.assertEqual([p.key for p in app.panels], keys)
+        self.assertIsNotNone(app.panels[0].blank_size)
+        app.select_order("extra")
+        self.assertEqual(len(app.order_list.curselection()), 1)
+        self.assertNotIn(0, app.order_list.curselection())
+        app.order_list.selection_clear(0, "end")
+        app.order_list.selection_set(0)
+        app.remove_panel()
+        self.assertFalse(any(p.blank_size is not None for p in app.panels))
+        self.assertFalse(any(r.get("type") == "blank" for r in app.extra_images))
+
+    def test_blank_only_layout_exports_and_restores_without_source_images(self):
+        app = self.app
+        app.files, app.image = [], None
+        app.add_blank()
+        app.add_blank()
+        self.assertEqual(len(app.panels), 2)
+        self.assertNotEqual(app.panels[0].key, app.panels[1].key)
+        expected_size = (app.panels[0].blank_size[0]*2+app.options().gap+app.options().margin*2,
+                         app.panels[0].blank_size[1]+app.options().margin*2)
+        project = self.path / "blanks-only.json"
+        with patch("crop_image.filedialog.asksaveasfilename", return_value=str(project)):
+            app.save_project()
+        with patch("crop_image.filedialog.askopenfilename", return_value=str(project)):
+            app.open_project()
+        self.assertFalse(self.errors, self.errors)
+        output = self.path / "blanks-only.png"
+        with patch("crop_image.filedialog.asksaveasfilename", return_value=str(output)):
+            app.export_layout()
+        self.finish()
+        with Image.open(output) as saved:
+            self.assertEqual(saved.size, expected_size)
+            self.assertEqual(saved.convert("RGB").getextrema(), ((255, 255),)*3)
 
     def test_append_plain_images_does_not_create_roi_and_resizes_to_first_image(self):
         app = self.app
@@ -470,9 +709,9 @@ class AppTests(unittest.TestCase):
     def test_invalid_or_cancelled_append_keeps_existing_materials(self):
         self.generate()
         app = self.app
-        good, bad = self.path / "good.png", self.path / "bad.png"
+        good, bad = self.path / "good.png", self.path / "bad.tif"
         Image.new("RGB", (30, 20)).save(good)
-        Image.new("I;16", (30, 20)).save(bad)
+        Image.new("F", (30, 20)).save(bad)
         keys = [p.key for p in app.panels]
         with patch.object(app, "_fail") as fail:
             with patch("crop_image.filedialog.askopenfilenames", return_value=[str(good), str(bad)]):
@@ -815,13 +1054,98 @@ class AppTests(unittest.TestCase):
         self.root.update()
         self.assertEqual(app.index, 0)
         entry = app.coordinate_entries[0]
+        entry.delete(0, "end")
+        entry.insert(0, "123")
+        entry.icursor(1)
         entry.focus_force()
         self.root.update()
         entry.event_generate("<Right>")
         self.root.update()
         self.assertEqual(app.index, 0)
+        self.assertEqual(entry.index("insert"), 2)
         self.assertTrue(app.root.bind("<Left>"))
         self.assertTrue(app.root.bind("<Right>"))
+
+    def test_editor_arrow_keys_work_when_file_list_or_annotation_list_has_focus(self):
+        app = self.app
+        self.root.deiconify()
+        app.notebook.select(app.edit_tab)
+        self.root.update()
+        for widget in (app.file_list, app.shape_tree, app.notebook):
+            with self.subTest(widget=widget.winfo_class()):
+                app._select_file(0)
+                widget.focus_force()
+                self.root.update()
+                widget.event_generate("<Right>")
+                self.root.update()
+                self.assertEqual(app.index, 1)
+                self.assertEqual(app.file_list.curselection(), (1,))
+                widget.event_generate("<Left>")
+                self.root.update()
+                self.assertEqual(app.index, 0)
+                self.assertEqual(app.notebook.select(), str(app.edit_tab))
+
+    def test_clicking_editor_canvas_releases_entry_focus_for_arrow_navigation(self):
+        app = self.app
+        self.root.deiconify()
+        app.notebook.select(app.edit_tab)
+        self.root.update()
+        entry = app.coordinate_entries[0]
+        entry.focus_force()
+        self.root.update()
+        app.canvas.event_generate("<ButtonPress-1>", x=0, y=0)
+        app.canvas.event_generate("<ButtonRelease-1>", x=0, y=0)
+        self.root.update()
+        self.assertEqual(self.root.focus_get(), app.canvas)
+        app.canvas.event_generate("<Right>")
+        self.root.update()
+        self.assertEqual(app.index, 1)
+
+    def test_arrow_navigation_does_not_switch_images_on_layout_tab_or_mid_drawing(self):
+        app = self.app
+        self.root.deiconify()
+        app.notebook.select(app.edit_tab)
+        self.root.update()
+        app.canvas.focus_force()
+        app.drawing = Shape("rectangle", (.1, .1, .2, .2))
+        app.canvas.event_generate("<Right>")
+        self.root.update()
+        self.assertEqual(app.index, 0)
+        app.drawing = None
+        app.notebook.select(app.layout_tab)
+        app.order_list.focus_force()
+        self.root.update()
+        app.order_list.event_generate("<Right>")
+        self.root.update()
+        self.assertEqual(app.index, 0)
+        app.notebook.select(app.edit_tab)
+        self.root.update()
+        self.assertEqual(self.root.focus_get(), app.canvas)
+        app.canvas.event_generate("<Right>")
+        self.root.update()
+        self.assertEqual(app.index, 1)
+
+    def test_windows_num_lock_and_extended_arrow_flags_do_not_block_navigation(self):
+        if self.root.tk.call("tk", "windowingsystem") != "win32":
+            self.skipTest("Windows modifier bits")
+        app = self.app
+        self.root.deiconify()
+        app.notebook.select(app.edit_tab)
+        self.root.update()
+        app.canvas.focus_force()
+        self.root.update()
+        for state in (0x0008, 0x40008):
+            with self.subTest(state=hex(state)):
+                app.canvas.event_generate("<Right>", state=state)
+                self.root.update()
+                self.assertEqual(app.index, 1)
+                app.canvas.event_generate("<Left>", state=state)
+                self.root.update()
+                self.assertEqual(app.index, 0)
+        for state in (0x0004, 0x20000):
+            with self.subTest(modifier=hex(state)):
+                app._navigate_key(SimpleNamespace(widget=app.canvas, state=state), 1)
+                self.assertEqual(app.index, 0)
 
     def test_original_dimensions_show_native_and_layout_output_sizes(self):
         app = self.app

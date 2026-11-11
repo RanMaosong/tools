@@ -11,8 +11,8 @@ CONFIG_PATH = Path(os.environ.get("CROP_IMAGE_CONFIG", Path(__file__).with_name(
 # header offsets) are algorithm/file-format constants, not adjustable settings.
 REQUIRED = {
     "window": "width height min_width min_height screen_margin_x screen_margin_y reference_dpi",
-    "editor": "line_width arrow_size arrow_step arrow_min_size arrow_tip_offset arrow_head_half_width_ratio arrow_notch_ratio minimum_rectangle_side minimum_arrow_length selection_dash canvas_padding minimum_view_scale",
-    "layout": "columns gap margin panel_width roi_scale roi_width roi_height dpi label_size label_padding label_text_offset_x preview_min_font_size preview_padding preview_min_size drop_outline_width",
+    "editor": "line_width arrow_size arrow_antialias_scale annotation_tile_size arrow_step arrow_min_size arrow_tip_offset arrow_head_half_width_ratio arrow_notch_ratio minimum_rectangle_side minimum_arrow_length selection_dash canvas_padding minimum_view_scale",
+    "layout": "columns gap margin panel_width roi_scale roi_width roi_height blank_width blank_height dpi label_size label_padding label_text_offset_x preview_min_font_size preview_padding preview_min_size drop_outline_width",
     "limits": "line_width_min line_width_max arrow_size_min arrow_size_max columns_min columns_max spacing_max panel_width_max roi_scale_min roi_scale_max label_size_min label_size_max dpi_min dpi_max max_output_pixels filename_max_chars",
     "timing": "poll_ms image_redraw_ms layout_preview_ms",
     "ui": "space_xs space_sm space_md space space_section space_lg space_outer button_padding button_pack_padding top_padding notebook_padding sidebar_width editor_image_weight editor_sidebar_weight shape_list_rows shape_type_width shape_coordinate_width color_chip_width number_input_width coordinate_input_width list_width order_list_rows file_list_rows layout_sidebar_width roi_settings_height method_dialog_width method_dialog_height layout_sidebar_weight layout_preview_weight layout_mode_width layout_input_width layout_fields_per_row interpolation_width list_font_size editor_hint_font_size layout_hint_font_size editor_hint_min_position layout_hint_min_x layout_hint_min_y layout_help_wrap_width drag_scroll_edge drag_scroll_units file_index_digits coordinate_decimals",
@@ -69,7 +69,7 @@ def load_config(path=CONFIG_PATH):
         raise ValueError("editor.arrow_min_size 超出箭头大小范围")
     if data["window"]["min_width"] > data["window"]["width"] or data["window"]["min_height"] > data["window"]["height"]:
         raise ValueError("窗口最小尺寸不能大于默认尺寸")
-    if any(data["layout"][name] > limits["spacing_max"] for name in ("gap", "margin")) or any(data["layout"][name] > limits["panel_width_max"] for name in ("panel_width", "roi_width", "roi_height")):
+    if any(data["layout"][name] > limits["spacing_max"] for name in ("gap", "margin")) or any(data["layout"][name] > limits["panel_width_max"] for name in ("panel_width", "roi_width", "roi_height", "blank_width", "blank_height")):
         raise ValueError("默认排版间距、边距或宽度超出 limits 范围")
     return data
 

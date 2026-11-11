@@ -3,7 +3,7 @@
 Preview images must never be passed to these export functions. Coordinates are
 fractions of the oriented source image, so a batch may contain different sizes.
 """
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import math
 from pathlib import Path
@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 from PIL import Image, ImageColor, ImageDraw, ImageOps
 from settings import CONFIG
+from high_depth import Image16, display_image, read_png16, read_tiff16, save_image16
+from arrow_render import draw_arrows
 
 
 EDITOR = CONFIG["editor"]
@@ -49,18 +51,26 @@ class Shape:
 def load_image(path, rotation=0):
     with open(path, "rb") as stream:
         header = stream.read(26)
-    if header[:8] == b"\x89PNG\r\n\x1a\n" and len(header) > 24 and header[24] > 8:
-        raise ValueError(f"{Path(path).name} 是 16 位 PNG；为避免静默转换成 8 位，暂不处理。")
+    png16 = header[:8] == b"\x89PNG\r\n\x1a\n" and len(header) > 24 and header[24] == 16
     with Image.open(path) as source:
-        # Pillow's color drawing is 8 bit. Refuse silent conversion of scientific
-        # high-bit-depth / floating-point data instead of destroying its range.
         bits = source.tag_v2.get(258, ()) if hasattr(source, "tag_v2") else ()
         bits = (bits,) if isinstance(bits, int) else bits
-        if source.mode not in ("1", "L", "LA", "P", "RGB", "RGBA") or any(b > 8 for b in bits):
-            raise ValueError(f"{Path(path).name} 为 {source.mode} / 高位深图像。为避免精度损失，暂不转换；请使用已完成窗宽窗位映射的 8 位显示图。")
-        image = ImageOps.exif_transpose(source)
-        image = image.convert("RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB")
-        image.info = {key: value for key, value in source.info.items() if key in ("icc_profile", "dpi")}
+        info = {key: value for key, value in source.info.items() if key in ("icc_profile", "dpi")}
+        if png16 or (bits and all(b == 16 for b in bits)):
+            image = read_png16(path, info) if png16 else read_tiff16(path, info)
+            orientation = source.getexif().get(274, 1)
+            method = {2: Image.Transpose.FLIP_LEFT_RIGHT, 3: Image.Transpose.ROTATE_180,
+                      4: Image.Transpose.FLIP_TOP_BOTTOM, 5: Image.Transpose.TRANSPOSE,
+                      6: Image.Transpose.ROTATE_270, 7: Image.Transpose.TRANSVERSE,
+                      8: Image.Transpose.ROTATE_90}.get(orientation)
+            if method is not None:
+                image = image.transpose(method)
+        else:
+            if source.mode not in ("1", "L", "LA", "P", "RGB", "RGBA") or any(b > 8 for b in bits):
+                raise ValueError(f"{Path(path).name} 为不支持的 {source.mode} 图像；暂不转换浮点、有符号或其他位深的数据，以免丢失精度。")
+            image = ImageOps.exif_transpose(source)
+            image = image.convert("RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB")
+            image.info = info
         if rotation % 360:
             turns = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_270}
             image = image.transpose(turns[rotation % 360])
@@ -142,24 +152,55 @@ def stroke_width(shape, size, reference_size):
     return shape.width * min(size[0] / reference_size[0], size[1] / reference_size[1])
 
 
+def annotate_arrows(image, shapes, reference_size, source_size=None, crop_box=None):
+    source_size = source_size or image.size
+    left, top, right, bottom = crop_box or (0, 0, *source_size)
+    sx, sy = image.width/(right-left), image.height/(bottom-top)
+    arrows = []
+    for shape in shapes:
+        shape.validate()
+        if shape.kind != "arrow":
+            continue
+        box = pixel_box(shape, source_size)
+        polygon, width = arrow_geometry(shape, source_size, reference_size)
+        box = ((box[0]-left)*sx, (box[1]-top)*sy, (box[2]-left)*sx, (box[3]-top)*sy)
+        polygon = [((x-left)*sx, (y-top)*sy) for x, y in polygon]
+        arrows.append((box, polygon, width*min(sx, sy), shape.color))
+    return draw_arrows(image, arrows)
+
+
 def annotate(image, shapes, reference_size, kind):
+    if kind == "arrow":
+        return annotate_arrows(image, shapes, reference_size)
     result = image.copy()
-    draw = ImageDraw.Draw(result)
+    layer = Image.new("RGBA", image.size) if isinstance(image, Image16) else result
+    draw = ImageDraw.Draw(layer)
     for shape in shapes:
         shape.validate()
         if shape.kind != kind:
             continue
         box = pixel_box(shape, image.size)
         width = max(1, round(stroke_width(shape, image.size, reference_size)))
-        if kind == "rectangle":
-            # Crop coordinates are exclusive at right/bottom; draw inside them.
-            draw.rectangle((box[0], box[1], box[2] - 1, box[3] - 1), outline=shape.color, width=width)
-        else:
-            polygon, arrow_width = arrow_geometry(shape, image.size, reference_size)
-            width = max(1, round(arrow_width))
-            draw.line(box, fill=shape.color, width=width)
-            draw.polygon(polygon, fill=shape.color, outline=shape.color, width=width)
+        # Crop coordinates are exclusive at right/bottom; draw inside them.
+        draw.rectangle((box[0], box[1], box[2] - 1, box[3] - 1), outline=shape.color, width=width)
+    if isinstance(result, Image16):
+        result.overlay_annotations(layer)
     return result
+
+
+@dataclass
+class ArrowSource:
+    image: Image.Image | Image16
+    shapes: tuple
+    reference_size: tuple
+    source_size: tuple
+    crop_box: tuple
+
+    def render(self, size, resample, preview=False):
+        image = display_image(self.image) if preview else self.image
+        if image.size != size:
+            image = image.resize(size, resample)
+        return annotate_arrows(image, self.shapes, self.reference_size, self.source_size, self.crop_box)
 
 
 @dataclass
@@ -168,7 +209,9 @@ class Panel:
     group: str
     kind: str
     title: str
-    image: Image.Image
+    image: Image.Image | Image16
+    arrow_source: ArrowSource | None = None
+    blank_size: tuple[int, int] | None = None
 
 
 def make_panels(files, shapes, reference_size, rotation=0):
@@ -180,10 +223,13 @@ def make_panels(files, shapes, reference_size, rotation=0):
         title = Path(filename).stem
         yield Panel(f"{group}:original", group, "original", title, annotate(image, shapes, reference_size, "rectangle"))
         arrows = annotate(image, shapes, reference_size, "arrow")
+        arrow_shapes = tuple(replace(shape) for shape in shapes if shape.kind == "arrow")
         for roi_index, shape in enumerate(rectangles):
-            roi = arrows.crop(pixel_box(shape, image.size))
+            box = pixel_box(shape, image.size)
+            roi = arrows.crop(box)
             roi.info = image.info.copy()
-            yield Panel(f"{group}:roi-{roi_index}", group, f"roi-{roi_index}", f"{title} · ROI {roi_index + 1}", roi)
+            source = ArrowSource(image.crop(box), arrow_shapes, tuple(reference_size), image.size, box) if arrow_shapes else None
+            yield Panel(f"{group}:roi-{roi_index}", group, f"roi-{roi_index}", f"{title} · ROI {roi_index + 1}", roi, source)
 
 
 def save_lossless(image, path, dpi=LAYOUT["dpi"]):
@@ -201,7 +247,10 @@ def save_lossless(image, path, dpi=LAYOUT["dpi"]):
     handle, temp_path = tempfile.mkstemp(dir=path.parent, suffix=suffix)
     os.close(handle)
     try:
-        image.save(temp_path, format="PNG" if suffix == ".png" else "TIFF", **options)
+        if isinstance(image, Image16):
+            save_image16(image, temp_path, dpi)
+        else:
+            image.save(temp_path, format="PNG" if suffix == ".png" else "TIFF", **options)
         os.replace(temp_path, path)
     finally:
         if os.path.exists(temp_path):
@@ -260,6 +309,7 @@ class LayoutOptions:
     label_size: int = LAYOUT["label_size"]
     dpi: int = LAYOUT["dpi"]
     roi_settings: dict = field(default_factory=dict)
+    panel_offsets: dict = field(default_factory=dict)
 
     def validate(self):
         if self.mode not in ("relative", "below", "right", "rows", "free"):
@@ -273,6 +323,13 @@ class LayoutOptions:
         if self.interpolation not in ("nearest", "lanczos"):
             raise ValueError("未知放大算法")
         ImageColor.getrgb(self.background)
+        if not isinstance(self.panel_offsets, dict):
+            raise ValueError("图片位置必须为对象")
+        for key, offset in self.panel_offsets.items():
+            if not isinstance(key, str) or not key or not isinstance(offset, dict) or set(offset) != {"x", "y"}:
+                raise ValueError("图片位置记录无效")
+            if any(type(value) is not int or abs(value) > MAX_OUTPUT_PIXELS for value in offset.values()):
+                raise ValueError("图片位置必须是有效范围内的整数像素")
         if not isinstance(self.roi_settings, dict):
             raise ValueError("ROI 设置必须是对象")
         for kind, setting in self.roi_settings.items():
@@ -333,14 +390,15 @@ def layout_plan(panels, options):
     # Resolve a stable reference without letting an extra image reference its
     # own unscaled source when dragged to the front. In grouped modes the first
     # method's original is its first image; free mode follows individual order.
-    reference = next((p for p in panels if p.kind != "extra"), panels[0])
+    fallback = next((p for p in panels if p.blank_size is None), panels[0])
+    reference = next((p for p in panels if p.kind != "extra"), fallback)
     if options.mode != "free":
         reference = next((p for p in panels if p.group == reference.group and p.kind == "original"), reference)
 
     def size(panel):
         image = panel.image
         if panel.kind == "extra":
-            return reference.image.size if reference.kind == "extra" else size(reference)
+            return (reference.blank_size or reference.image.size) if reference.kind == "extra" else size(reference)
         setting = options.roi_settings.get(panel.kind)
         if setting:
             width, height = setting["width"], setting["height"]
@@ -471,7 +529,55 @@ def layout_plan(panels, options):
             x += width + gap
         total_width = max(total_width, x - gap + options.margin)
         y += row_height + gap
+    if any(item.panel.key in options.panel_offsets for item in result):
+        result = [Placement(item.panel, item.x+options.panel_offsets.get(item.panel.key, {}).get("x", 0),
+                            item.y+options.panel_offsets.get(item.panel.key, {}).get("y", 0), item.width, item.height)
+                  for item in result]
+        min_x, min_y = min(item.x for item in result), min(item.y for item in result)
+        if min_x < 0 or min_y < 0:
+            result = [Placement(item.panel, item.x-min_x, item.y-min_y, item.width, item.height) for item in result]
+        return result, (max(item.x+item.width for item in result)+options.margin,
+                        max(item.y+item.height+label for item in result)+options.margin)
     return result, (total_width, y - gap + options.margin)
+
+
+def linked_panel_keys(panels, key):
+    panel = next((panel for panel in panels if panel.key == key), None)
+    if panel is None:
+        return set()
+    if panel.kind != "original":
+        return {key}
+    return {item.key for item in panels if item.key == key or
+            (item.group == panel.group and item.kind.startswith("roi-"))}
+
+
+def move_panel_to(panels, options, key, x, y):
+    """Edit a displayed position, committing any origin shift for all images.
+
+    Offsets are relative to the automatic layout, so later column/order changes
+    still work while keeping each image's individual adjustment.
+    """
+    if any(type(value) is not int or abs(value) > MAX_OUTPUT_PIXELS for value in (x, y)):
+        raise ValueError("距左、距上必须是有效范围内的整数像素")
+    current, _ = layout_plan(panels, options)
+    if key not in {item.panel.key for item in current}:
+        raise ValueError("请先点击需要移动的排版图片")
+    selected = next(item for item in current if item.panel.key == key)
+    linked = linked_panel_keys(panels, key)
+    dx, dy = x-selected.x, y-selected.y
+    wanted = {item.panel.key: (item.x+dx, item.y+dy) if item.panel.key in linked else (item.x, item.y) for item in current}
+    min_x, min_y = min(point[0] for point in wanted.values()), min(point[1] for point in wanted.values())
+    shift_x, shift_y = (-min_x, -min_y) if min_x < 0 or min_y < 0 else (0, 0)
+    automatic, _ = layout_plan(panels, replace(options, panel_offsets={}))
+    offsets = {}
+    for item in automatic:
+        px, py = wanted[item.panel.key]
+        dx, dy = px+shift_x-item.x, py+shift_y-item.y
+        if dx or dy:
+            offsets[item.panel.key] = {"x": dx, "y": dy}
+    updated = replace(options, panel_offsets=offsets)
+    updated.validate()
+    return updated
 
 
 def label_font(size):
@@ -492,15 +598,21 @@ def render_layout(panels, options, preview_size=None):
         factor = 1
         if width * height > MAX_OUTPUT_PIXELS:
             raise ValueError(f"排版为 {width} × {height}，超过配置上限 {MAX_OUTPUT_PIXELS:,} 像素。请减少每批图片或调整 ROI 输出尺寸；不会自动降低分辨率。")
-    canvas = Image.new("RGBA", (max(1, math.ceil(width * factor)), max(1, math.ceil(height * factor))), options.background)
-    draw = ImageDraw.Draw(canvas)
+    canvas_size = max(1, math.ceil(width * factor)), max(1, math.ceil(height * factor))
+    high_depth = not preview_size and any(isinstance(p.image, Image16) for p in panels)
+    canvas = Image16.new(canvas_size, options.background) if high_depth else Image.new("RGBA", canvas_size, options.background)
     font = label_font(max(LAYOUT["preview_min_font_size"], round(options.label_size * factor))) if options.labels else None
     resample = Image.Resampling.NEAREST if options.interpolation == "nearest" else Image.Resampling.LANCZOS
     hitboxes = []
     for item in placements:
         x, y = round(item.x * factor), round(item.y * factor)
         w, h = max(1, round(item.width * factor)), max(1, round(item.height * factor))
-        image = item.panel.image
+        if item.panel.blank_size is not None:
+            # A placeholder reserves space but never paints over real pixels.
+            # Skipping it is alpha=0 compositing, even on a white canvas.
+            hitboxes.append((item.panel.key, (x, y, x+w, y+h)))
+            continue
+        image = display_image(item.panel.image) if preview_size else item.panel.image
         # A user-entered ROI size is a bounding cell. Preserve aspect ratio and
         # center the image, padding with the background instead of stretching it.
         if item.panel.kind == "extra":
@@ -511,20 +623,23 @@ def render_layout(panels, options, preview_size=None):
             fit = min(item.width/item.panel.image.width, item.height/item.panel.image.height)
             image_w = min(w, max(1, round(item.panel.image.width*fit*factor)))
             image_h = min(h, max(1, round(item.panel.image.height*fit*factor)))
-        if image.size != (image_w, image_h):
+        if item.panel.arrow_source is not None and (preview_size or image.size != (image_w, image_h)):
+            image = item.panel.arrow_source.render((image_w, image_h), Image.Resampling.LANCZOS if preview_size else resample,
+                                                   preview=bool(preview_size))
+        elif image.size != (image_w, image_h):
             image = image.resize((image_w, image_h), Image.Resampling.LANCZOS if preview_size or item.panel.kind == "extra" else resample)
         # Paste without mask keeps RGBA pixel values, including source alpha.
         canvas.paste(image, (x+(w-image_w)//2, y+(h-image_h)//2))
-        if font:
+        if font and item.panel.blank_size is None:
             # Clip labels to their own cells; never overwrite neighboring images.
             label_h = max(1, round((options.label_size + LAYOUT["label_padding"]) * factor))
             strip = Image.new("RGBA", (w, label_h), options.background)
             ImageDraw.Draw(strip).text((LAYOUT["label_text_offset_x"], 0), item.panel.title, fill="#222222", font=font)
             canvas.paste(strip, (x, y + h))
         hitboxes.append((item.panel.key, (x, y, x + w, y + h)))
-    profiles = {p.image.info.get("icc_profile") for p in panels}
+    profiles = {p.image.info.get("icc_profile") for p in panels if p.blank_size is None}
     if len(profiles) > 1:
         raise ValueError("素材的 ICC 色彩配置不同，无法在不改变像素颜色的前提下合成。请先统一素材的色彩空间。")
-    if profiles != {None}:
+    if profiles and profiles != {None}:
         canvas.info["icc_profile"] = next(iter(profiles))
     return canvas, (width, height), hitboxes

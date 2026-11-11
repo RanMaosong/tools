@@ -1,5 +1,8 @@
 # Project dependencies pinned to the current Windows / Python 3.14.7 environment.
 Pillow==13.0.0
+numpy==2.5.4
+pypng==0.20220715.0
+tifffile==2026.11.8
 
 # tkinter (Tk 9) is supplied by Python/Conda, not installed through pip.
 # All other imports, including unittest, are from the Python standard library.

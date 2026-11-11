@@ -302,10 +302,10 @@ class ImageCoreTests(unittest.TestCase):
         preview, _, _ = render_layout(panels, LayoutOptions(panel_width=10000), (500, 500))
         self.assertLessEqual(preview.width, 500)
 
-    def test_high_bit_depth_is_rejected_without_modifying_source(self):
-        for extension in (".png", ".tif"):
-            path = self.path / ("16bit"+extension)
-            Image.new("I;16", (20, 10), 32000).save(path)
+    def test_float_and_signed_images_are_rejected_without_modifying_source(self):
+        for mode in ("F", "I"):
+            path = self.path / (mode+".tif")
+            Image.new(mode, (20, 10), -12).save(path)
             before = path.read_bytes()
             with self.assertRaises(ValueError):
                 load_image(path)
